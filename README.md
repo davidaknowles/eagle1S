@@ -1,6 +1,6 @@
 # eagle1S
 
-Re-implementation of EAGLE using Stan. 
+Re-implementation of EAGLE using Stan: https://mc-stan.org/
 
 ## Original EAGLE 
 
