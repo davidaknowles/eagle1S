@@ -1,0 +1,99 @@
+---
+title: "Fit simulated data using EAGLE"
+---
+
+## Setup 
+
+```{r}
+require(tidyverse)
+require(magrittr)
+require(foreach)
+require(doMC)
+registerDoMC(7)
+require(eagle1S)
+```
+
+## Setting(s)
+
+```{r}
+EASY_MODE = F
+cisdist = 10000
+```
+
+## Load data
+
+```{r}
+which_chr="22"
+DATADIR=paste0("../simulation_easy", EASY_MODE, "/")
+ase=read_tsv(paste0(DATADIR,"ase.txt.gz")) %>% filter(CHROM==which_chr)
+meta = read_tsv(paste0(DATADIR, "meta.txt.gz")) %>% mutate(individual=as.character(individual))
+phased=read_tsv(paste0(DATADIR,"haplotypes.vcf.gz"), comment = "##") %>% rename(CHROM=`#CHROM`)
+```
+
+## Load ground truth from simulation
+
+```{r}
+truth = read_tsv(paste0(DATADIR,"true_model.txt.gz"))
+```
+
+## Setup to run
+
+```{r}
+outputdir=paste0(DATADIR,"/eagle1S_fits/")
+dir.create( outputdir, showWarnings = F )
+checkpoint_dir=paste0(outputdir,which_chr,"/")
+dir.create(checkpoint_dir, recursive = T, showWarnings = F)
+```
+
+## Run on 100 exonic SNPs
+
+```{r}
+exonic_snps_to_fit = unique(ase$POS)[1:100] 
+
+allres = ase %>% 
+  filter(POS %in% exonic_snps_to_fit) %>% 
+  eagle1S(phased, 
+          meta, 
+          cisdist = cisdist, 
+          checkpoint_dir=checkpoint_dir)
+
+#res_file= gzfile( paste0(outputdir,which_chr,".txt.gz"), "w" )
+#allres %>% write_tsv(res_file)
+#close(res_file)
+```
+
+How many cis SNPs tested per exonic SNP? 
+```{r}
+allres %>% group_by(exonic_snp_pos) %>% summarize(n=n())
+```
+
+How often did we find the correct eSNP? 
+```{r}
+lead_eqtls = allres %>% get_lead_eQTL()
+
+lead_eqtls_w_truth = lead_eqtls %>% left_join(truth, by=c(`exonic_snp_pos`="exonic_snp")) 
+
+lead_eqtls_w_truth %>% filter(eqtl > 0) %>% with(reg_snp_pos == reg_snp) %>% mean()
+```
+
+p-values as a function of ground truth model.
+```{r}
+lead_eqtls_w_truth %>% group_by(eqtl, gxe) %>% summarize(m=mean(bonf_p)) 
+```
+
+How often did we find the correct gxeSNP? 
+```{r}
+lead_gxe = allres %>% get_lead_gxeQTL()
+
+lead_gxe_w_truth = lead_gxe %>% left_join(truth, by=c(`exonic_snp_pos`="exonic_snp"))
+
+lead_gxe_w_truth %>% filter(gxe > 0) %>% with(reg_snp_pos == reg_snp) %>% mean()
+```
+
+```{r}
+lead_gxe_w_truth %>% group_by(eqtl, gxe) %>% summarize(m=mean(bonf_p)) 
+```
+
+
+
+

@@ -13,7 +13,7 @@ get_lead_helper=function(results_table) {
   top_n(1, -bonf_p) %>%
   ungroup() %>%
   mutate(q=p.adjust(pmin(1, bonf_p), method="BH")) %>%
-  select(reg_snp_pos, exonic_snp_pos, p, bonf_p, q)
+  select(reg_snp_pos, exonic_snp_pos, p, bonf_p, q, conc, starts_with("beta_"))
 }
 
 #' Get lead eQTLs
@@ -146,10 +146,13 @@ eagle1S = function(ase,
               conc=conc_init)
        }
 
+       # are we testing the exonic SNP itself (or a perfectly linked SNP)
+       testing_self_flag = length(unique(ase_temp$het_x)) == 1
+
        # full model with eqtl and gxe
-       x_full = if (length(unique(ase_temp$het_x)) > 1)
+       x_full = if (!testing_self_flag)
          model.matrix( ~ het_x + x:het_x, data=ase_temp ) else
-           model.matrix( ~ x, data=ase_temp ) # testing the exonic SNP itself
+           model.matrix( ~ x, data=ase_temp )
 
        stan_dat = list(N=nrow(x_full),
                        P=ncol(x_full),
@@ -161,13 +164,18 @@ eagle1S = function(ase,
 
        fit_full=if (det(t(x_full) %*% x_full) > 0) {
          optimizing(stanmodels$bb,
-                    data=stan_dat,
-                    init=get_init(x_full),
-                    iter=max_iter)$value
-       } else as.numeric(NA)
+                  data=stan_dat,
+                  init=get_init(x_full),
+                  iter=max_iter)
+       } else {
+         list(value=NA,
+              par=rep(NA, 1 + ncol(x_full)))
+       }
+       # TODO: does this work when testing the exonic SNP itself?
+       names(fit_full$par) = c("conc","intercept", if (!testing_self_flag) "b_eqtl", "b_gxe")
 
        # eqtl but no gxe model
-       x_eqtl = if (length(unique(ase_temp$het_x)) > 1)
+       x_eqtl = if (!testing_self_flag)
          model.matrix( ~ het_x , data=ase_temp ) else
            model.matrix( ~ 1, data=ase_temp )
        stan_dat$x=x_eqtl
@@ -188,19 +196,19 @@ eagle1S = function(ase,
                         init=get_init(x_0),
                         iter=max_iter)$value
 
+       df=ncol(x_full) - ncol(x_eqtl)
+
        if (F) { # debugging code
          ase_temp %>% mutate(het=reg_geno,
                              coverage=r+a,
-                             ar = r/coverage,
-                             in_phase=geno == reg_geno,
-                             car=ifelse(in_phase,ar,1-ar)) %>%
-           ggplot(aes( x,car,size=coverage,col=het)) + geom_point() + ylim(0,1) +
+                             ar = a/coverage,
+                             in_phase=geno == reg_geno) %>%
+           ggplot(aes( x,ar,size=coverage,col=factor(het_x))) + geom_point() + ylim(0,1) +
            xlab("Environmental factor") + ylab("Phased allelic ratio")
-         pchisq( 2.0*(fit_full - fit_eqtl), df = df, lower.tail = F)
+         pchisq( 2.0*(fit_full$value - fit_eqtl), df = df, lower.tail = F)
          pchisq( 2.0*(fit_eqtl - fit_0), df = 1, lower.tail = F)
        }
 
-       df=ncol(x_full) - ncol(x_eqtl)
        num_het_ind=length(unique(ase_temp %>% filter(het_x != 0) %>% .$individual)) # for performance analysis later
 
        data_frame(total_count=sum(coverage),
@@ -210,7 +218,8 @@ eagle1S = function(ase,
                   df=df,
                   l0=fit_0,
                   l_geno=fit_eqtl,
-                  l_interact=fit_full)
+                  l_interact=fit_full$value,
+                  ) %>% cbind(as_data_frame(as.list(fit_full$par)))
      }
 
      if (!is.null(checkpoint_dir)){
@@ -220,6 +229,7 @@ eagle1S = function(ase,
        close(checkpoint_file)
      }
 
-     temp_results %>% mutate(exonic_snp_pos=exonic_snp_pos)
+     temp_results %>%
+       mutate(exonic_snp_pos=exonic_snp_pos)
     }
 }

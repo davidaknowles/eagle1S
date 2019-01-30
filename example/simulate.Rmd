@@ -1,0 +1,181 @@
+---
+title: "Simulate data for EAGLE"
+---
+
+## Setup
+
+```{r}
+require(tidyverse)
+require(magrittr)
+require(foreach)
+require(doMC)
+registerDoMC(7)
+require(intervals)
+```
+
+## Download and process common SNPs
+
+```{bash eval=F}
+wget ftp://ftp.ncbi.nlm.nih.gov/snp/organisms/human_9606_b151_GRCh38p7/VCF/common_all_20180418.vcf.gz
+zcat < common_all_20180418.vcf.gz | awk '22 == $1' | gzip > temp.gz
+```
+
+## Setting(s)
+
+```{r}
+EASY_MODE = T
+cisdist = 10000
+DATADIR="../data/"
+```
+
+## Filter for chr22
+
+```{r eval=F}
+snps = read_tsv(paste0(DATADIR,"chr22_snps.vcf.gz"), comment="##") %>% 
+  mutate(caf = str_match( INFO, "CAF=([0-9.]+)" )[,2]  %>% as.numeric(),
+         maf = pmin(caf, 1-caf), 
+         minor = ifelse(caf > 0.5, ALT, REF), 
+         major = ifelse(caf > 0.5, REF, ALT),
+         ALT = minor,
+         REF = major) %>% 
+  select(POS, ID, REF, ALT, maf) %>%
+  filter(nchar(REF)==1, nchar(ALT)==1, maf >= 0.05) # Only keep biallelic SNPs with MAF>=0.05
+snps %>% write_tsv("data/chr22_snps.txt.gz")
+```
+
+## Generate haplotypes/genotypes
+
+```{r}
+snps = read_tsv(paste0(DATADIR,"chr22_snps.txt.gz"))
+hist(snps$maf)
+```
+
+```{r}
+if (EASY_MODE) snps %<>% mutate(maf = .5) 
+
+num_ind = 300
+
+make_haps = function() { (foreach(i=1:num_ind, .combine=cbind) %do% { 
+  as.numeric(runif(nrow(snps)) < snps$maf) }) %>% 
+    set_rownames(snps$ID) %>% 
+    set_colnames(NULL) 
+  }
+hap1 = make_haps()  # num_ind x num_snps
+hap2 = make_haps()
+```
+
+## Load exons
+
+```{r eval=F}
+read_tsv(paste0(DATADIR,'exons_GRCh38.saf.gz')) %>% 
+  filter(Chr=="chr22") %>% 
+  select(-Chr) %>% 
+  write_tsv(paste0(DATADIR,"exons_GRCh38_chr22.saf.gz"))
+```
+
+```{r}
+exons = read_tsv(paste0(DATADIR,"/exons_GRCh38_chr22.saf.gz"))
+```
+
+## What SNPs are exonic? 
+
+```{r}
+exon_intervals = exons %>% 
+  select(Start, End) %>% 
+  Intervals() %>% 
+  intervals::reduce()
+
+snps %<>% mutate(is_exonic = distance_to_nearest(POS, exon_intervals) == 0 )
+
+mean(snps$is_exonic)
+```
+
+## Simulation parameters
+
+```{r}
+exonic_snps = snps %>% filter(is_exonic)
+  
+num_exonic_snps = sum(snps$is_exonic)
+
+environmental_factor = 2. * runif(num_ind) - 1.
+
+effect_sizes = data_frame(intercept = 30.0, 
+           eqtl = ifelse(runif(num_exonic_snps) < 0.5, 
+                         20.0, 
+                         0.0), 
+           gxe = ifelse(runif(num_exonic_snps) < 0.5, 
+                        20.0, 
+                        0.0) )
+```
+
+## Pick eSNPs for each exonic SNP
+
+```{r}
+e_snps = foreach(exonic_snp_index=1:num_exonic_snps, .combine=bind_rows) %dopar% {
+  exonic_snp = exonic_snps[exonic_snp_index,] # TODO: what happens if this is empty? 
+  snps %>% filter( abs(POS - exonic_snp$POS) < cisdist) %>% sample_n(1)
+}
+```
+
+## Simulate ASE
+
+```{r}
+ase = foreach(exonic_snp_index=1:num_exonic_snps, .combine=bind_rows) %dopar% { 
+  exonic_snp = exonic_snps[exonic_snp_index,]
+  e_snp = e_snps[exonic_snp_index,]
+  hap1_here = hap1[e_snp$ID,]
+  hap2_here = hap2[e_snp$ID,]
+  
+  effect_sizes_here = effect_sizes[exonic_snp_index,]
+  make_counts = function(hap_here) {
+    hap_mean = with( effect_sizes_here, intercept + eqtl * hap_here + gxe * hap_here * environmental_factor) # intercept gxe
+    #if (EASY_MODE)  
+    rpois(n=num_ind, lambda=hap_mean)
+    # else 
+    #  MASS::rnegbin(n=num_ind, mu=hap_mean, theta=5) 
+  }
+  hap1_counts = make_counts(hap1_here)
+  hap2_counts = make_counts(hap2_here)
+  stopifnot(all(!is.na(hap1_counts)))
+  stopifnot(all(!is.na(hap2_counts)))
+  inphase = hap1[exonic_snp$ID,] < hap2[exonic_snp$ID,]
+  
+  res = exonic_snp %>% cbind( individual = 1:num_ind,
+                              environmental_factor,
+              r = ifelse(inphase, hap1_counts, hap2_counts), # major_allele_counts
+              a = ifelse(inphase, hap2_counts, hap1_counts), # minor_allele_counts
+              is_het = hap1[exonic_snp$ID,] != hap2[exonic_snp$ID,]
+              )
+  # positive effect size means minor allele increases expression
+  if (F) {
+    hap_r = ifelse(inphase, hap1_here, hap2_here)
+    hap_a = ifelse(inphase, hap2_here, hap1_here)
+    res %>% ggplot(aes(environmental_factor, a/(r + a), col=interaction(hap_r, hap_a))) + geom_point()
+    
+    res %>% mutate(het_x = ifelse(hap1_here != hap2_here, # if cisSNP is het
+                                  ifelse(hap1_here == hap1[exonic_snp$ID,],1,-1), # is it in phase with the exonicSNP?
+                                  0) ) %>% 
+      filter(is_het) %>%
+      ggplot(aes(environmental_factor, a/(r + a), col=factor(het_x))) + geom_point()
+  }
+  
+  res %>% 
+    filter(is_het) %>% 
+    select(-is_het, -maf, -is_exonic, -ID, -environmental_factor)
+}
+```
+
+## Save results to file
+
+```{r}
+phased = hap1
+phased[] = paste(hap1, hap2, sep="|") # keep dimensions
+sim_dir=paste0("../simulation_easy", EASY_MODE, "/")
+dir.create(sim_dir)
+cbind(`#CHROM`="22", snps %>% select(-maf, -is_exonic), QUAL=".", FILTER=".", INFO=".", FORMAT="GT", phased) %>% write_tsv(paste0(sim_dir, "haplotypes.vcf.gz"))
+e_snps %>% select(reg_snp = POS) %>% 
+  cbind( exonic_snps %>% select(exonic_snp = POS) ) %>% cbind(effect_sizes) %>% write_tsv(paste0(sim_dir, "true_model.txt.gz"))
+cbind(CHROM="22", ase) %>% write_tsv(paste0(sim_dir, "ase.txt.gz"))
+data_frame(individual=1:num_ind, x=environmental_factor) %>% write_tsv(paste0(sim_dir, "meta.txt.gz"))
+```
+
